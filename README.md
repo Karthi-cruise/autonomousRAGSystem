@@ -200,6 +200,16 @@ Free-tier cloud deploys run with `LIGHTWEIGHT_DEPLOY=1`, which avoids large FAIS
 4. Add `OPENAI_API_KEY` in Variables for full LLM generation and verification.
 5. Share the Railway domain after deploy.
 
+#### Hugging Face Spaces
+
+Use this if Render's free memory/build limits are blocked.
+
+1. Create a new Space at `https://huggingface.co/new-space`.
+2. Choose **Docker** as the Space SDK.
+3. Import or upload this GitHub repo.
+4. Add `OPENAI_API_KEY` in Space secrets for full LLM generation and verification.
+5. The Dockerfile defaults to port `7860`, which Spaces expects.
+
 ### 8. Environment
 
 - **OPENAI_API_KEY** — Required for full answer generation and hallucination verification (platform.openai.com)

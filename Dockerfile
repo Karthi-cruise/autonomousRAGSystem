@@ -19,6 +19,6 @@ COPY . .
 RUN python scripts/bootstrap_sample_db.py
 RUN python -m src.main --ingest
 
-EXPOSE 8000
+EXPOSE 7860
 
-CMD ["sh", "-c", "uvicorn src.api:create_app --factory --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn src.api:create_app --factory --host 0.0.0.0 --port ${PORT:-7860}"]
