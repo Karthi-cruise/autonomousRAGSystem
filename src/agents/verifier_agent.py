@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 from src.utils.schema import Verdict, VerificationResult
 
@@ -52,7 +54,8 @@ class VerifierAgent:
         api_key: str | None = None,
     ):
         key = api_key or os.environ.get("OPENAI_API_KEY")
-        self.llm = ChatOpenAI(model=model, temperature=0, api_key=key) if key else None
+        self.model = model
+        self.client = OpenAI(api_key=key) if key and OpenAI else None
     
     def verify(
         self,
@@ -61,7 +64,7 @@ class VerifierAgent:
         context: str,
     ) -> VerificationResult:
         """Verify if answer is grounded in context. Returns verdict and scores."""
-        if not self.llm:
+        if not self.client:
             return VerificationResult(
                 verdict=Verdict.ACCEPT,
                 hallucination_score=0.0,
@@ -75,8 +78,12 @@ class VerifierAgent:
             answer=answer,
         )
         try:
-            response = self.llm.invoke([HumanMessage(content=prompt)])
-            text = response.content
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response.choices[0].message.content or ""
         except Exception as e:
             return VerificationResult(
                 verdict=Verdict.ACCEPT,

@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Literal, Optional, TypedDict
+from typing import Any, Literal, Optional, TypedDict
 
-from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+try:
+    from langgraph.graph import StateGraph
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import SystemMessage, HumanMessage
+except ImportError:
+    StateGraph = None
+    ChatOpenAI = None
+    SystemMessage = None
+    HumanMessage = None
 
 from src.agents.retriever_agent import RetrieverAgent
 from src.agents.verifier_agent import VerifierAgent
@@ -159,9 +165,11 @@ def create_rag_graph(
     max_retrieve_attempts: int = 2,
 ) -> StateGraph:
     """Build the LangGraph RAG pipeline."""
+    if StateGraph is None:
+        raise RuntimeError("LangGraph is not installed. Use run_rag() direct pipeline instead.")
 
     api_key = os.environ.get("OPENAI_API_KEY")
-    llm = ChatOpenAI(model=generator_model, temperature=0.1, api_key=api_key) if api_key else None
+    llm = ChatOpenAI(model=generator_model, temperature=0.1, api_key=api_key) if api_key and ChatOpenAI else None
 
     def retrieve_node(state: RAGState) -> dict:
         """Retrieve documents with trust and decay."""
@@ -316,6 +324,14 @@ def run_rag(
     max_retrieve_attempts: int = 2,
 ) -> RAGResponse:
     """Run the full RAG pipeline and return final response."""
+    if os.environ.get("LIGHTWEIGHT_DEPLOY") == "1" or StateGraph is None:
+        return run_rag_direct(
+            query=query,
+            retriever=retriever,
+            verifier=verifier,
+            updater=updater,
+        )
+
     graph_builder = create_rag_graph(
         retriever,
         verifier,
@@ -356,4 +372,84 @@ def run_rag(
         verification_explanation=v.explanation if v else "",
         verdict=v.verdict if v else Verdict.ACCEPT,
         actions=final.get("actions", []),
+    )
+
+
+def _build_context_and_explanations(
+    retriever: RetrieverAgent,
+    retrieval: RetrievalResult,
+) -> tuple[str, list[str], list[str]]:
+    context = "\n\n---\n\n".join(d.to_context_str() for d in retrieval.documents)
+    trust_explanations = [
+        retriever.hybrid_search.trust_scorer.explain_trust(d.metadata)
+        for d in retrieval.documents
+    ]
+    decay_explanations = [
+        retriever.hybrid_search.decay_model.explain_decay(d.metadata)
+        for d in retrieval.documents
+    ]
+    return context, trust_explanations, decay_explanations
+
+
+def _generate_answer_direct(query: str, context: str, retrieval: RetrievalResult) -> str:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return _extractive_answer(query, retrieval)
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": RAG_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
+            ],
+        )
+        return response.choices[0].message.content or _extractive_answer(query, retrieval)
+    except Exception:
+        return _extractive_answer(query, retrieval)
+
+
+def run_rag_direct(
+    query: str,
+    retriever: RetrieverAgent,
+    verifier: VerifierAgent,
+    updater: Optional[UpdaterAgent] = None,
+) -> RAGResponse:
+    """Low-memory RAG pipeline for free-tier deployments."""
+    retrieval = retriever.retrieve(query)
+    context, trust_explanations, decay_explanations = _build_context_and_explanations(
+        retriever,
+        retrieval,
+    )
+    answer = (
+        _generate_answer_direct(query, context, retrieval)
+        if context
+        else "I could not find relevant documents to answer this question."
+    )
+    citations = []
+    for doc in retrieval.documents:
+        if doc.metadata.source not in citations:
+            citations.append(doc.metadata.source)
+
+    verification = verifier.verify(query=query, answer=answer, context=context)
+    actions: list[dict[str, Any]] = []
+    if verification.verdict == Verdict.FLAG_KB_ISSUE and updater:
+        actions.append(updater.handle_verification_failure(
+            query=query,
+            answer=answer,
+            reason=verification.explanation,
+        ))
+
+    return RAGResponse(
+        answer=answer,
+        citations=citations,
+        trust_explanations=trust_explanations,
+        decay_explanations=decay_explanations,
+        verification_explanation=verification.explanation,
+        verdict=verification.verdict,
+        actions=actions,
     )
