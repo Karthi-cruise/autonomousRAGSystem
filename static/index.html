@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Autonomous RAG</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --text: #172026;
+      --muted: #66717a;
+      --line: #d9e0e6;
+      --accent: #087f8c;
+      --accent-dark: #05636d;
+      --warn: #a15c00;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main {
+      width: min(980px, calc(100vw - 32px));
+      margin: 32px auto;
+      display: grid;
+      gap: 16px;
+    }
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(1.75rem, 3vw, 2.5rem);
+      letter-spacing: 0;
+    }
+    .status {
+      color: var(--muted);
+      font-size: 0.95rem;
+      text-align: right;
+    }
+    form {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 12px;
+      font-size: 1rem;
+      color: var(--text);
+    }
+    button {
+      border: 0;
+      border-radius: 6px;
+      padding: 0 18px;
+      min-height: 44px;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent-dark); }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    #answer {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      min-height: 220px;
+      white-space: pre-wrap;
+      line-height: 1.55;
+    }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      min-width: 0;
+    }
+    h2 {
+      margin: 0 0 8px;
+      font-size: 0.9rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+    .error { color: var(--warn); }
+    @media (max-width: 760px) {
+      header, form { grid-template-columns: 1fr; }
+      header { align-items: start; }
+      .status { text-align: left; }
+      form { display: grid; }
+      button { width: 100%; }
+      .meta { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Autonomous RAG</h1>
+      </div>
+      <div class="status" id="status">Checking system...</div>
+    </header>
+
+    <form id="query-form">
+      <input id="query" name="query" value="What is the API rate limit?" autocomplete="off" required>
+      <button id="submit" type="submit">Ask</button>
+    </form>
+
+    <div id="answer">Ask a question to search documents, SQL tables, and configured REST sources.</div>
+
+    <div class="meta">
+      <section>
+        <h2>Citations</h2>
+        <ul id="citations"></ul>
+      </section>
+      <section>
+        <h2>Trust</h2>
+        <ul id="trust"></ul>
+      </section>
+      <section>
+        <h2>Decay</h2>
+        <ul id="decay"></ul>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const statusEl = document.querySelector("#status");
+    const form = document.querySelector("#query-form");
+    const queryEl = document.querySelector("#query");
+    const submitEl = document.querySelector("#submit");
+    const answerEl = document.querySelector("#answer");
+    const citationsEl = document.querySelector("#citations");
+    const trustEl = document.querySelector("#trust");
+    const decayEl = document.querySelector("#decay");
+    const apiBase = window.location.protocol === "file:" ? "http://127.0.0.1:8000" : "";
+
+    function renderList(el, items) {
+      el.innerHTML = "";
+      for (const item of items || []) {
+        const li = document.createElement("li");
+        li.textContent = item;
+        el.appendChild(li);
+      }
+    }
+
+    async function refreshStatus() {
+      try {
+        const [health, tools] = await Promise.all([
+          fetch(`${apiBase}/health`).then((r) => r.json()),
+          fetch(`${apiBase}/tools`).then((r) => r.json()),
+        ]);
+        statusEl.textContent = `${health.status.toUpperCase()} | Tools: ${(tools.tools || []).join(", ") || "Vector only"}`;
+      } catch {
+        statusEl.textContent = "Start server";
+        answerEl.textContent = "Start the API server first, then open http://127.0.0.1:8000. Directly opening this HTML file cannot run the Python backend by itself.";
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      submitEl.disabled = true;
+      answerEl.textContent = "Searching...";
+      try {
+        const response = await fetch(`${apiBase}/query`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ query: queryEl.value }),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const data = await response.json();
+        answerEl.textContent = data.answer || "No answer returned.";
+        renderList(citationsEl, data.citations);
+        renderList(trustEl, data.trust_explanations);
+        renderList(decayEl, data.decay_explanations);
+      } catch (error) {
+        answerEl.innerHTML = `<span class="error">${error.message}</span>`;
+      } finally {
+        submitEl.disabled = false;
+      }
+    });
+
+    refreshStatus();
+  </script>
+</body>
+</html>

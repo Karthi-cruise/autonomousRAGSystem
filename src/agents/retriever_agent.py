@@ -3,22 +3,30 @@
 from __future__ import annotations
 
 from src.retrieval.hybrid_search import HybridSearch
-from src.utils.schema import RetrievalResult, RetrievedDocument
+from src.tools.manager import ToolManager
+from src.utils.schema import RetrievalResult
 
 
 class RetrieverAgent:
     """Retrieves relevant documents using hybrid search with trust & decay."""
     
-    def __init__(self, hybrid_search: HybridSearch):
+    def __init__(self, hybrid_search: HybridSearch, tool_manager: ToolManager | None = None):
         self.hybrid_search = hybrid_search
+        self.tool_manager = tool_manager
     
     def retrieve(self, query: str, top_k: int | None = None) -> RetrievalResult:
         """Retrieve candidate documents with explainability."""
         docs = self.hybrid_search.search(query, top_k=top_k)
+        if self.tool_manager:
+            docs.extend(self.tool_manager.search(query))
+            docs.sort(key=lambda d: (d.effective_score, d.retrieval_score), reverse=True)
+            if top_k:
+                docs = docs[:top_k]
         
         explainability = {
             "query": query,
             "num_docs": len(docs),
+            "tools": self.tool_manager.describe() if self.tool_manager else [],
             "sources": [
                 {
                     "source": d.metadata.source,

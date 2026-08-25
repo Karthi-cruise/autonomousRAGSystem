@@ -86,7 +86,12 @@ class UpdaterAgent:
         self.vector_store.index = faiss.IndexFlatIP(emb.shape[1])
         self.vector_store.index.add(np.array(emb, dtype=np.float32))
         self.vector_store.documents = [
-            {"id": f"doc_{i}", "content": d} for i, d in enumerate(new_docs)
+            {
+                "id": f"doc_{i}",
+                "content": d,
+                "content_hash": self.vector_store._content_hash(d),
+            }
+            for i, d in enumerate(new_docs)
         ]
         self.vector_store.metadata_list = new_meta
         self.vector_store.current_version += 1
@@ -100,6 +105,32 @@ class UpdaterAgent:
         if success:
             self.hybrid_search.update_bm25()
         return success
+
+    def handle_verification_failure(
+        self,
+        query: str,
+        answer: str,
+        reason: str,
+        rollback_on_failure: bool = True,
+    ) -> dict[str, Any]:
+        """Record verifier failures and rollback the vector store when possible."""
+        versions = self.list_versions()
+        current_version = self.vector_store.current_version
+        rolled_back_to = None
+
+        if rollback_on_failure:
+            previous_versions = [version for version in versions if version < current_version]
+            if previous_versions and self.rollback(previous_versions[-1]):
+                rolled_back_to = previous_versions[-1]
+
+        return {
+            "query": query,
+            "answer_preview": answer[:300],
+            "reason": reason,
+            "current_version": current_version,
+            "rolled_back_to": rolled_back_to,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
     
     def list_versions(self) -> list[int]:
         """List available versions."""

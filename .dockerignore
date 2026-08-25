@@ -1,0 +1,13 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.DS_Store
+.env
+.env.local
+data/cache
+data/processed/faiss_index
+results
+experiments
+notebooks

@@ -8,9 +8,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.main import build_system, ingest_documents, query
+from scripts.bootstrap_sample_db import create_sample_db
 
 
 def main():
+    root = Path(__file__).parent.parent
+    create_sample_db(root / "data" / "metadata" / "sample_knowledge.db")
+
     print("Building Autonomous RAG System...")
     system = build_system()
 

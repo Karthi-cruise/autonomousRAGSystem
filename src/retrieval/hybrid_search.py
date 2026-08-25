@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import re
-from typing import Callable
 
-import numpy as np
 from rank_bm25 import BM25Okapi
 
 from src.retrieval.vector_store import VersionedVectorStore
-from src.utils.schema import DocumentMetadata, RetrievedDocument
+from src.utils.schema import RetrievedDocument
 from src.scoring.trust_scoring import TrustScorer
 from src.scoring.decay_model import DecayModel
 
@@ -34,6 +32,7 @@ class HybridSearch:
         self.top_k = top_k
         self._bm25_index: BM25Okapi | None = None
         self._bm25_corpus: list[str] = []
+        self._bm25_tokens: list[list[str]] = []
         self._build_bm25()
     
     def _tokenize(self, text: str) -> list[str]:
@@ -44,11 +43,12 @@ class HybridSearch:
         """Build BM25 index from current documents."""
         if self.vector_store.documents:
             self._bm25_corpus = [d["content"] for d in self.vector_store.documents]
-            tokenized = [self._tokenize(d) for d in self._bm25_corpus]
-            self._bm25_index = BM25Okapi(tokenized)
+            self._bm25_tokens = [self._tokenize(d) for d in self._bm25_corpus]
+            self._bm25_index = BM25Okapi(self._bm25_tokens)
         else:
             self._bm25_index = None
             self._bm25_corpus = []
+            self._bm25_tokens = []
     
     def update_bm25(self) -> None:
         """Rebuild BM25 after vector store updates."""
@@ -64,13 +64,16 @@ class HybridSearch:
         if not self.vector_store.documents:
             return []
         
+        candidate_k = max(k * 4, k)
+
         # Get query embedding
         query_embedding = self.vector_store.embedding_model.encode(
             query, normalize_embeddings=True
         )
         
         # FAISS semantic search
-        faiss_results = self.vector_store.search(query_embedding, top_k=k * 2)
+        faiss_results = self.vector_store.search(query_embedding, top_k=candidate_k)
+        faiss_scores = {idx: max(0.0, score) for idx, score in faiss_results}
         
         # BM25 lexical search
         bm25_scores = {}
@@ -78,26 +81,44 @@ class HybridSearch:
             tokenized_query = self._tokenize(query)
             bm25_raw = self._bm25_index.get_scores(tokenized_query)
             max_bm = max(bm25_raw) if max(bm25_raw) > 0 else 1.0
-            for i, s in enumerate(bm25_raw):
-                bm25_scores[i] = s / max_bm if max_bm > 0 else 0
+            if max(bm25_raw) > 0:
+                for i, s in enumerate(bm25_raw):
+                    bm25_scores[i] = s / max_bm if max_bm > 0 else 0
+            else:
+                query_terms = set(tokenized_query)
+                overlap_scores = [
+                    len(query_terms & set(doc_tokens)) / len(query_terms)
+                    if query_terms else 0.0
+                    for doc_tokens in self._bm25_tokens
+                ]
+                max_overlap = max(overlap_scores) if overlap_scores else 0.0
+                if max_overlap > 0:
+                    for i, s in enumerate(overlap_scores):
+                        bm25_scores[i] = s / max_overlap
         
-        # Combine scores (reciprocal rank fusion style)
+        # Combine semantic and lexical candidate pools. BM25-only documents must
+        # be allowed into the final ranking for exact-term enterprise queries.
+        candidate_indices = set(faiss_scores)
+        candidate_indices.update(
+            idx
+            for idx, score in sorted(bm25_scores.items(), key=lambda x: -x[1])[:candidate_k]
+            if score > 0
+        )
+
         combined: dict[int, float] = {}
-        for rank, (idx, faiss_score) in enumerate(faiss_results):
-            bm25_s = bm25_scores.get(idx, 0)
-            comb = self.faiss_weight * faiss_score + self.bm25_weight * bm25_s
-            combined[idx] = comb
-        
-        # Sort and take top_k
-        sorted_indices = sorted(combined.items(), key=lambda x: -x[1])[:k]
+        for idx in candidate_indices:
+            combined[idx] = (
+                self.faiss_weight * faiss_scores.get(idx, 0.0)
+                + self.bm25_weight * bm25_scores.get(idx, 0.0)
+            )
         
         # Build RetrievedDocuments with effective score (retrieval × trust × decay)
         results = []
-        explainability = []
         
-        for idx, retrieval_score in sorted_indices:
+        for idx, retrieval_score in combined.items():
             content, metadata = self.vector_store.get_document(idx)
             trust_score = self.trust_scorer.get_trust_score(metadata)
+            metadata.trust_score = trust_score
             decay_factor = self.decay_model.get_decay_factor(metadata.timestamp)
             effective_score = retrieval_score * trust_score * decay_factor
             
@@ -109,13 +130,6 @@ class HybridSearch:
                 effective_score=effective_score,
                 doc_id=doc_id,
             ))
-            
-            explainability.append({
-                "source": metadata.source,
-                "retrieval_score": retrieval_score,
-                "trust_score": trust_score,
-                "decay_factor": decay_factor,
-                "effective_score": effective_score,
-            })
         
-        return results
+        results.sort(key=lambda d: (d.effective_score, d.retrieval_score), reverse=True)
+        return results[:k]

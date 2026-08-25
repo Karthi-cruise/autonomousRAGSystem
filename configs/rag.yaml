@@ -8,9 +8,24 @@ retrieval:
   top_k: 5
   faiss_hybrid_weight: 0.6  # Weight for semantic search vs BM25
   bm25_weight: 0.4
+  max_retrieve_attempts: 2
+  tool_top_k: 5
+
+tools:
+  sql:
+    enabled: true
+    database_path: "data/metadata/sample_knowledge.db"
+    tables: ["policies", "api_docs"]
+    trust_score: 0.85
+    max_rows: 5
+  rest:
+    enabled: false
+    endpoints: []
 
 trust_scoring:
   default_trust: 0.5
+  trusted_domains: []
+  manual_overrides: {}
   decay_half_life_days: 180
   manual_trust_weights:
     domain_reputation: 0.3

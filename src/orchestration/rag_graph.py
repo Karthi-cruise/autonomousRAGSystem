@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from typing import Annotated, Any, Literal, Optional, TypedDict
+import re
+from typing import Literal, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
@@ -26,6 +27,114 @@ Always cite your sources using [Source: <source_name>] format.
 Be concise and accurate."""
 
 
+EXTRACTIVE_STOPWORDS = {
+    "about",
+    "after",
+    "also",
+    "and",
+    "are",
+    "can",
+    "does",
+    "for",
+    "from",
+    "has",
+    "have",
+    "how",
+    "into",
+    "is",
+    "must",
+    "of",
+    "our",
+    "should",
+    "the",
+    "their",
+    "this",
+    "to",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "your",
+}
+
+
+def _terms(text: str) -> set[str]:
+    """Tokenize text into comparable query/content terms."""
+    return {
+        token
+        for token in re.findall(r"\b[a-z0-9][a-z0-9_-]*\b", text.lower())
+        if len(token) > 2 and token not in EXTRACTIVE_STOPWORDS
+    }
+
+
+def _passages(content: str) -> list[str]:
+    """Split retrieved content into compact passages for offline generation."""
+    blocks = re.split(r"\n\s*\n+", content)
+    cleaned = []
+    for block in blocks:
+        block = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", block.strip())
+        block = re.sub(r"(?m)^\s*[-*]\s+", "", block)
+        block = re.sub(r"\s+", " ", block).strip()
+        if block:
+            cleaned.append(block)
+    return cleaned
+
+
+def _extractive_answer(query: str, retrieval: Optional[RetrievalResult]) -> str:
+    """Generate a grounded answer from retrieved passages without an LLM."""
+    if not retrieval or not retrieval.documents:
+        return "I could not find relevant documents to answer this question."
+
+    query_terms = _terms(query)
+    candidates = []
+    for doc_rank, doc in enumerate(retrieval.documents):
+        for passage_rank, passage in enumerate(_passages(doc.content)):
+            passage_terms = _terms(passage)
+            overlap = query_terms & passage_terms
+            phrase_bonus = sum(
+                1
+                for term in query_terms
+                if term in passage.lower()
+            )
+            score = (len(overlap) * 2) + phrase_bonus + doc.effective_score
+            if overlap:
+                candidates.append((
+                    score,
+                    doc.effective_score,
+                    -doc_rank,
+                    -passage_rank,
+                    passage,
+                    doc.metadata.source,
+                ))
+
+    if not candidates:
+        first = retrieval.documents[0]
+        passage = _passages(first.content)[0][:600]
+        return (
+            "I found related context, but it does not directly answer the question. "
+            f"Most relevant excerpt: {passage} [Source: {first.metadata.source}]"
+        )
+
+    candidates.sort(reverse=True)
+    selected = []
+    seen_passages = set()
+    seen_sources = set()
+    for _, _, _, _, passage, source in candidates:
+        key = passage.lower()
+        if key in seen_passages or source in seen_sources:
+            continue
+        selected.append(f"{passage} [Source: {source}]")
+        seen_passages.add(key)
+        seen_sources.add(source)
+        if len(selected) >= 2:
+            break
+
+    return " ".join(selected)
+
+
 class RAGState(TypedDict):
     query: str
     retrieval: Optional[RetrievalResult]
@@ -34,6 +143,7 @@ class RAGState(TypedDict):
     citations: list[str]
     verification: Optional[VerificationResult]
     verdict: str
+    actions: list[dict]
     trust_explanations: list[str]
     decay_explanations: list[str]
     iteration: int
@@ -88,8 +198,7 @@ def create_rag_graph(
             }
 
         if not llm:
-            first_chunk = context.split("\n\n---\n\n")[0][:500] if context else ""
-            answer = f"Based on retrieved context: {first_chunk}...[Set OPENAI_API_KEY for full generation]"
+            answer = _extractive_answer(query, state["retrieval"])
         else:
             try:
                 messages = [
@@ -99,8 +208,7 @@ def create_rag_graph(
                 response = llm.invoke(messages)
                 answer = response.content
             except Exception:
-                first_chunk = context.split("\n\n---\n\n")[0][:500] if context else ""
-                answer = f"Based on retrieved context: {first_chunk}...[Set OPENAI_API_KEY for full generation]"
+                answer = _extractive_answer(query, state["retrieval"])
 
         citations = []
         if state["retrieval"]:
@@ -153,13 +261,23 @@ def create_rag_graph(
             decay_explanations=state.get("decay_explanations", []),
             verification_explanation=verification_explanation,
             verdict=verdict,
+            actions=state.get("actions", []),
         )
         return {"final_response": response}
 
     def update_kb_node(state: RAGState) -> dict:
-        """Placeholder for KB update - logged for explainability."""
-        # In production: updater would ingest new docs or flag for review
-        return {}
+        """Handle verifier-raised KB issues with rollback-safe maintenance."""
+        if not updater:
+            return {"actions": []}
+
+        verification = state.get("verification")
+        reason = verification.explanation if verification else "Verifier flagged a KB issue."
+        action = updater.handle_verification_failure(
+            query=state["query"],
+            answer=state["answer"],
+            reason=reason,
+        )
+        return {"actions": [action]}
 
     # Build graph
     workflow = StateGraph(RAGState)
@@ -194,9 +312,17 @@ def run_rag(
     retriever: RetrieverAgent,
     verifier: VerifierAgent,
     updater: Optional[UpdaterAgent] = None,
+    generator_model: str = "gpt-4o-mini",
+    max_retrieve_attempts: int = 2,
 ) -> RAGResponse:
     """Run the full RAG pipeline and return final response."""
-    graph_builder = create_rag_graph(retriever, verifier, updater)
+    graph_builder = create_rag_graph(
+        retriever,
+        verifier,
+        updater,
+        generator_model=generator_model,
+        max_retrieve_attempts=max_retrieve_attempts,
+    )
     graph = graph_builder.compile()
 
     initial_state: RAGState = {
@@ -207,6 +333,7 @@ def run_rag(
         "citations": [],
         "verification": None,
         "verdict": "accept",
+        "actions": [],
         "trust_explanations": [],
         "decay_explanations": [],
         "iteration": 0,
@@ -228,4 +355,5 @@ def run_rag(
         decay_explanations=final.get("decay_explanations", []),
         verification_explanation=v.explanation if v else "",
         verdict=v.verdict if v else Verdict.ACCEPT,
+        actions=final.get("actions", []),
     )

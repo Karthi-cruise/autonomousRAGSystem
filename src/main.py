@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from src.retrieval.vector_store import VersionedVectorStore
@@ -13,8 +12,11 @@ from src.agents.retriever_agent import RetrieverAgent
 from src.agents.verifier_agent import VerifierAgent
 from src.agents.updater_agent import UpdaterAgent
 from src.orchestration.rag_graph import run_rag
+from src.tools.manager import ToolManager
+from src.tools.rest_tool import RestTool
+from src.tools.sql_tool import SQLTool
 from src.utils.config import load_config, get_project_root
-from src.utils.document_loader import load_documents_from_dir, load_document
+from src.utils.document_loader import load_documents_from_dir
 
 
 def build_system(config: dict | None = None):
@@ -38,6 +40,7 @@ def build_system(config: dict | None = None):
     decay_cfg = cfg.get("decay_model", {})
     vs_cfg = cfg.get("vector_store", {})
     llm_cfg = cfg.get("llm", {})
+    tools_cfg = cfg.get("tools", {})
 
     base_path = root / vs_cfg.get("path", "data/processed/faiss_index")
 
@@ -47,13 +50,17 @@ def build_system(config: dict | None = None):
         version_prefix=vs_cfg.get("version_prefix", "v"),
         cache_dir=cache_dir,
     )
+    vector_store.deduplicate(create_new_version=False)
 
     trust_scorer = TrustScorer(
         default_trust=trust_cfg.get("default_trust", 0.5),
+        trusted_domains=trust_cfg.get("trusted_domains", []),
+        manual_overrides=trust_cfg.get("manual_overrides", {}),
     )
 
     decay_model = DecayModel(
         half_life_days=decay_cfg.get("half_life_days", 180),
+        min_decay_factor=decay_cfg.get("min_decay_factor", 0.1),
     )
 
     hybrid_search = HybridSearch(
@@ -65,7 +72,26 @@ def build_system(config: dict | None = None):
         top_k=retrieval_cfg.get("top_k", 5),
     )
 
-    retriever = RetrieverAgent(hybrid_search)
+    tools = []
+    sql_cfg = tools_cfg.get("sql", {})
+    if sql_cfg.get("enabled"):
+        db_path = Path(sql_cfg.get("database_path", root / "data" / "metadata" / "knowledge.db"))
+        if not db_path.is_absolute():
+            db_path = root / db_path
+        tools.append(SQLTool(
+            database_path=db_path,
+            tables=sql_cfg.get("tables", []),
+            trust_score=sql_cfg.get("trust_score", 0.8),
+            max_rows=sql_cfg.get("max_rows", 5),
+        ))
+
+    rest_cfg = tools_cfg.get("rest", {})
+    if rest_cfg.get("enabled"):
+        tools.append(RestTool.from_config(rest_cfg.get("endpoints", [])))
+
+    tool_manager = ToolManager(tools=tools, top_k=retrieval_cfg.get("tool_top_k", 5)) if tools else None
+
+    retriever = RetrieverAgent(hybrid_search, tool_manager=tool_manager)
     verifier = VerifierAgent(model=llm_cfg.get("verifier_model", "gpt-4o-mini"))
     updater = UpdaterAgent(vector_store=vector_store, hybrid_search=hybrid_search)
 
@@ -74,6 +100,7 @@ def build_system(config: dict | None = None):
         "verifier": verifier,
         "updater": updater,
         "vector_store": vector_store,
+        "tools": tool_manager,
         "config": cfg,
     }
 
@@ -103,11 +130,15 @@ def ingest_documents(system: dict, data_dir: str | Path | None = None) -> int:
 
 def query(system: dict, question: str):
     """Run a query through the autonomous RAG pipeline."""
+    llm_cfg = system.get("config", {}).get("llm", {})
+    retrieval_cfg = system.get("config", {}).get("retrieval", {})
     return run_rag(
         query=question,
         retriever=system["retriever"],
         verifier=system["verifier"],
         updater=system["updater"],
+        generator_model=llm_cfg.get("generator_model", "gpt-4o-mini"),
+        max_retrieve_attempts=retrieval_cfg.get("max_retrieve_attempts", 2),
     )
 
 

@@ -18,6 +18,7 @@ data/cache/
 .idea/
 .vscode/
 *.swp
+.DS_Store
 
 # Env
 .env

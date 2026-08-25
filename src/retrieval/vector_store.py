@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pickle
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from src.utils.config import get_project_root
-from src.utils.schema import DocumentMetadata, RetrievedDocument
+from src.utils.schema import DocumentMetadata
 
 
 class VersionedVectorStore:
@@ -28,9 +29,12 @@ class VersionedVectorStore:
         import os
         if cache_dir:
             os.environ.setdefault("HF_HOME", str(cache_dir))
+        cached_model_path = self._cached_model_path(embedding_model, cache_dir)
+        model_name_or_path = str(cached_model_path or embedding_model)
         self.embedding_model = SentenceTransformer(
-            embedding_model,
+            model_name_or_path,
             cache_folder=str(cache_dir) if cache_dir else None,
+            local_files_only=bool(cached_model_path) or os.environ.get("HF_HUB_OFFLINE") == "1",
         )
         self.base_path = Path(base_path or get_project_root() / "data" / "processed" / "faiss_index")
         self.version_prefix = version_prefix
@@ -39,14 +43,61 @@ class VersionedVectorStore:
         self.metadata_list: list[DocumentMetadata] = []
         self.current_version = 0
         self._load_or_init()
+
+    def _version_number(self, version_path: Path) -> int:
+        """Return numeric version suffix, or -1 for non-version directories."""
+        version_num = version_path.name.replace(self.version_prefix, "", 1)
+        return int(version_num) if version_num.isdigit() else -1
+
+    def _version_dirs(self) -> list[Path]:
+        """List version directories in numeric order."""
+        return sorted(
+            (
+                p for p in self.base_path.iterdir()
+                if p.is_dir()
+                and p.name.startswith(self.version_prefix)
+                and self._version_number(p) >= 0
+            ),
+            key=self._version_number,
+        )
+
+    def _content_hash(self, content: str) -> str:
+        """Stable content fingerprint used to skip exact duplicate ingests."""
+        return sha256(content.encode("utf-8")).hexdigest()
+
+    def _cached_model_path(
+        self,
+        embedding_model: str,
+        cache_dir: str | Path | None,
+    ) -> Path | None:
+        """Return a complete HuggingFace snapshot path if it is cached locally."""
+        if not cache_dir or Path(embedding_model).exists():
+            return None
+
+        repo_dir = Path(cache_dir) / f"models--{embedding_model.replace('/', '--')}"
+        snapshots_dir = repo_dir / "snapshots"
+        if not snapshots_dir.exists():
+            return None
+
+        ref_file = repo_dir / "refs" / "main"
+        if ref_file.exists():
+            ref = ref_file.read_text().strip()
+            ref_snapshot = snapshots_dir / ref
+            if (ref_snapshot / "modules.json").exists():
+                return ref_snapshot
+
+        snapshots = [
+            path for path in snapshots_dir.iterdir()
+            if path.is_dir() and (path / "modules.json").exists()
+        ]
+        if not snapshots:
+            return None
+        return max(snapshots, key=lambda path: path.stat().st_mtime)
     
     def _load_or_init(self) -> None:
         """Load existing index or initialize empty."""
         self.base_path.mkdir(parents=True, exist_ok=True)
-        versions = sorted(
-            p for p in self.base_path.iterdir()
-            if p.is_dir() and p.name.startswith(self.version_prefix)
-        )
+        versions = self._version_dirs()
         if versions:
             self._load_version(versions[-1])
         else:
@@ -59,6 +110,10 @@ class VersionedVectorStore:
         index_file = version_path / "index.faiss"
         docs_file = version_path / "documents.pkl"
         meta_file = version_path / "metadata.json"
+
+        self.index = None
+        self.documents = []
+        self.metadata_list = []
         
         if index_file.exists():
             self.index = faiss.read_index(str(index_file))
@@ -96,6 +151,25 @@ class VersionedVectorStore:
         """Add documents to the store. Returns new version number."""
         if not documents:
             return self.current_version
+        if len(documents) != len(metadata_list):
+            raise ValueError("documents and metadata_list must have the same length")
+
+        existing_hashes = {
+            doc.get("content_hash") or self._content_hash(doc.get("content", ""))
+            for doc in self.documents
+        }
+        filtered: list[tuple[str, DocumentMetadata, str]] = []
+        for doc, meta in zip(documents, metadata_list):
+            content_hash = self._content_hash(doc)
+            if content_hash in existing_hashes:
+                continue
+            existing_hashes.add(content_hash)
+            filtered.append((doc, meta, content_hash))
+
+        if not filtered:
+            return self.current_version
+
+        documents = [doc for doc, _, _ in filtered]
         
         embeddings = self.embedding_model.encode(documents, normalize_embeddings=True)
         embeddings = np.array(embeddings, dtype=np.float32)
@@ -105,9 +179,13 @@ class VersionedVectorStore:
             self.index = faiss.IndexFlatIP(dim)
         
         self.index.add(embeddings)
-        for i, (doc, meta) in enumerate(zip(documents, metadata_list)):
-            doc_id = f"doc_{len(self.documents) + i}"
-            self.documents.append({"id": doc_id, "content": doc})
+        for doc, meta, content_hash in filtered:
+            doc_id = f"doc_{len(self.documents)}"
+            self.documents.append({
+                "id": doc_id,
+                "content": doc,
+                "content_hash": content_hash,
+            })
             self.metadata_list.append(meta)
         
         if create_new_version:
@@ -115,6 +193,47 @@ class VersionedVectorStore:
             self._save_version(self.current_version)
         
         return self.current_version
+
+    def deduplicate(self, create_new_version: bool = False) -> bool:
+        """Remove exact duplicate content while preserving first-seen metadata."""
+        seen_hashes = set()
+        unique: list[tuple[str, DocumentMetadata, str]] = []
+
+        for doc, meta in zip(self.documents, self.metadata_list):
+            content = doc.get("content", "")
+            content_hash = doc.get("content_hash") or self._content_hash(content)
+            if content_hash in seen_hashes:
+                continue
+            seen_hashes.add(content_hash)
+            unique.append((content, meta, content_hash))
+
+        if len(unique) == len(self.documents):
+            return False
+
+        if unique:
+            documents = [doc for doc, _, _ in unique]
+            embeddings = self.embedding_model.encode(documents, normalize_embeddings=True)
+            embeddings = np.array(embeddings, dtype=np.float32)
+            self.index = faiss.IndexFlatIP(embeddings.shape[1])
+            self.index.add(embeddings)
+        else:
+            self.index = None
+
+        self.documents = [
+            {
+                "id": f"doc_{i}",
+                "content": content,
+                "content_hash": content_hash,
+            }
+            for i, (content, _, content_hash) in enumerate(unique)
+        ]
+        self.metadata_list = [meta for _, meta, _ in unique]
+
+        if create_new_version:
+            self.current_version += 1
+            self._save_version(self.current_version)
+
+        return True
     
     def search(self, query_embedding: np.ndarray, top_k: int = 5) -> list[tuple[int, float]]:
         """Search for similar documents. Returns [(doc_idx, score), ...]."""
@@ -146,10 +265,4 @@ class VersionedVectorStore:
     
     def list_versions(self) -> list[int]:
         """List available versions for rollback."""
-        versions = []
-        for p in self.base_path.iterdir():
-            if p.is_dir() and p.name.startswith(self.version_prefix):
-                num = p.name.replace(self.version_prefix, "")
-                if num.isdigit():
-                    versions.append(int(num))
-        return sorted(versions)
+        return [self._version_number(p) for p in self._version_dirs()]

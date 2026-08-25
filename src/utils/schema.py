@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -20,7 +20,7 @@ class Verdict(Enum):
 class DocumentMetadata:
     """Metadata for each document in the knowledge base."""
     source: str
-    timestamp: datetime
+    timestamp: datetime | str
     author: str = ""
     publisher: str = ""
     trust_score: float = 0.5
@@ -39,8 +39,13 @@ class DocumentMetadata:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DocumentMetadata":
         ts = data.get("timestamp", "")
-        if isinstance(ts, str) and "T" in ts:
-            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if isinstance(ts, str) and ts:
+            try:
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        elif not ts:
+            ts = datetime.now(timezone.utc)
         return cls(
             source=data.get("source", ""),
             timestamp=ts,
@@ -99,3 +104,15 @@ class RAGResponse:
     decay_explanations: list[str]
     verification_explanation: str
     verdict: Verdict
+    actions: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "answer": self.answer,
+            "citations": self.citations,
+            "trust_explanations": self.trust_explanations,
+            "decay_explanations": self.decay_explanations,
+            "verification_explanation": self.verification_explanation,
+            "verdict": self.verdict.value,
+            "actions": self.actions,
+        }

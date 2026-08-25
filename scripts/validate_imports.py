@@ -13,7 +13,10 @@ def main():
     from src.scoring.trust_scoring import TrustScorer
     from src.scoring.decay_model import DecayModel
     from src.evaluation.metrics import compute_hallucination_rate
-    print("  config, schema, scoring, evaluation OK")
+    from src.tools.manager import ToolManager
+    from src.tools.rest_tool import RestTool
+    from src.tools.sql_tool import SQLTool
+    print("  config, schema, scoring, evaluation, tools OK")
 
     # Config loads
     cfg = load_config()
@@ -33,6 +36,12 @@ def main():
     rate = compute_hallucination_rate([Verdict.ACCEPT, Verdict.REJECT])
     assert rate == 0.5
     print("  metrics OK")
+
+    manager = ToolManager(tools=[])
+    assert manager.describe() == []
+    assert RestTool.from_config([]).endpoints == []
+    assert SQLTool(database_path=Path("missing.db"), tables=[]).search("anything") == []
+    print("  SQL/REST tools OK")
 
     print("\nAll imports and core logic validated successfully.")
 

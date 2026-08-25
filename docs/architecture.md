@@ -2,16 +2,16 @@
 
 ## Overview
 
-Multi-agent RAG with trust scoring, temporal decay, and hallucination detection.
+Multi-agent RAG with SQL/REST tool-calling, trust scoring, temporal decay, and hallucination detection.
 
 ## Data Flow
 
 1. **Query** → Retriever Agent
-2. **Retriever** → Hybrid search (FAISS + BM25) → Candidate docs
+2. **Retriever** → Hybrid search (FAISS + BM25) + SQL/REST tools → Candidate docs
 3. **Scoring** → Trust × Decay → Effective scores
 4. **Generator** → LLM answer from context
 5. **Verifier** → Hallucination check → Verdict
-6. **Updater** (on Flag KB) → Ingest / version / rollback
+6. **Updater** (on Flag KB) → Record issue / version / rollback
 
 ## Components
 
@@ -26,6 +26,12 @@ Multi-agent RAG with trust scoring, temporal decay, and hallucination detection.
 - FAISS for semantic similarity (sentence-transformers)
 - BM25 for lexical matching
 - Weighted combination
+
+### Tool-Calling Grounding
+
+- SQLite tool searches configured read-only tables and converts matching rows into grounded documents
+- REST tool calls configured GET endpoints and converts successful responses into grounded documents
+- Tool results are ranked with vector results using retrieval, trust, and freshness signals
 
 ### Trust Scorer
 

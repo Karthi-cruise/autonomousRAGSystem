@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: autonomous-rag-system
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false

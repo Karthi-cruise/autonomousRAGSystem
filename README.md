@@ -7,6 +7,7 @@
 ## Key Highlights
 
 - **Multi-Agent Architecture** — Retriever, Verifier, Updater agents coordinated via LangGraph
+- **Tool-Calling Retrieval** — Optional SQLite and configured REST API tools ground answers in live data
 - **Hybrid Search** — FAISS (semantic) + BM25 (lexical) for robust retrieval
 - **Trust & Decay** — Source reliability scoring and temporal decay prevent outdated/invalid knowledge
 - **Hallucination Detection** — Verifier LLM accepts, rejects, re-retrieves, or flags KB issues
@@ -29,7 +30,7 @@ Standard RAG systems blindly trust retrieved documents, ignore document age, and
 ## Solution Overview
 
 ```
-Query → Retrieval (Hybrid) → Trust & Decay Scoring → Answer Generation
+Query → Retrieval (Hybrid + SQL/REST Tools) → Trust & Decay Scoring → Answer Generation
   → Hallucination Verification → Autonomous KB Update → Final Response
 ```
 
@@ -40,7 +41,7 @@ Query → Retrieval (Hybrid) → Trust & Decay Scoring → Answer Generation
 ```
 User Query
     ↓
-Retriever Agent ──► Candidate Docs (FAISS + BM25)
+Retriever Agent ──► Candidate Docs (FAISS + BM25 + SQL + REST)
     ↓
 Generator (LLM)
     ↓
@@ -145,6 +146,7 @@ python -m venv .venv
 
 ```bash
 .venv/bin/python scripts/validate_imports.py
+.venv/bin/python -m unittest discover -s tests
 ```
 
 ### 3. Add Documents (optional)
@@ -158,6 +160,7 @@ Place PDFs, DOCX, or Markdown files in `data/raw/`. Sample content is included.
 ```
 
 First run downloads the embedding model (~80MB) from HuggingFace. Uses project-local cache in `data/cache/`.
+After a model snapshot exists in the local cache, the system loads it directly to avoid slow metadata retries in offline/restricted environments.
 
 ### 5. Query via CLI
 
@@ -174,10 +177,39 @@ First run downloads the embedding model (~80MB) from HuggingFace. Uses project-l
 # POST /ingest with {"content": "...", "source": "..."}
 ```
 
-### 7. Environment
+Open `http://localhost:8000` for the browser chat UI.
+
+### 7. Deploy for Friends
+
+The project includes `Dockerfile`, `render.yaml`, and `railway.json`.
+
+#### Render
+
+1. Push this folder to GitHub.
+2. In Render, choose **New +** → **Blueprint**.
+3. Select the GitHub repo. Render reads `render.yaml`.
+4. Add `OPENAI_API_KEY` when prompted for full LLM generation and verification.
+5. Share the Render URL. The homepage provides a chat UI; `/query` remains available as an API.
+
+#### Railway
+
+1. Push this folder to GitHub.
+2. In Railway, choose **New Project** → **Deploy from GitHub repo**.
+3. Select the repo. Railway uses `Dockerfile` and `railway.json`.
+4. Add `OPENAI_API_KEY` in Variables for full LLM generation and verification.
+5. Share the Railway domain after deploy.
+
+### 8. Environment
 
 - **OPENAI_API_KEY** — Required for full answer generation and hallucination verification (platform.openai.com)
-- Without it, retrieval + trust/decay work; generation uses a context fallback
+- Without it, retrieval + trust/decay work; generation uses a grounded extractive fallback
+
+### Tool Configuration
+
+`configs/rag.yaml` controls optional grounding tools:
+
+- `tools.sql` searches configured read-only SQLite tables.
+- `tools.rest` calls configured GET endpoints only.
 
 ---
 
