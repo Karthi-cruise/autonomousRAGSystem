@@ -5,5 +5,7 @@ services:
     plan: free
     healthCheckPath: /health
     envVars:
+      - key: LIGHTWEIGHT_DEPLOY
+        value: "1"
       - key: OPENAI_API_KEY
         sync: false

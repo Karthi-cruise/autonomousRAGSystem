@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import pickle
+import re
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
+
+try:
+    import faiss
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    faiss = None
+    SentenceTransformer = None
 
 from src.utils.config import get_project_root
 from src.utils.schema import DocumentMetadata
@@ -26,19 +33,22 @@ class VersionedVectorStore:
         version_prefix: str = "v",
         cache_dir: str | Path | None = None,
     ):
-        import os
         if cache_dir:
             os.environ.setdefault("HF_HOME", str(cache_dir))
-        cached_model_path = self._cached_model_path(embedding_model, cache_dir)
-        model_name_or_path = str(cached_model_path or embedding_model)
-        self.embedding_model = SentenceTransformer(
-            model_name_or_path,
-            cache_folder=str(cache_dir) if cache_dir else None,
-            local_files_only=bool(cached_model_path) or os.environ.get("HF_HUB_OFFLINE") == "1",
-        )
+        self.lightweight_mode = os.environ.get("LIGHTWEIGHT_DEPLOY") == "1" or SentenceTransformer is None
+        if self.lightweight_mode:
+            self.embedding_model = LightweightEmbeddingModel()
+        else:
+            cached_model_path = self._cached_model_path(embedding_model, cache_dir)
+            model_name_or_path = str(cached_model_path or embedding_model)
+            self.embedding_model = SentenceTransformer(
+                model_name_or_path,
+                cache_folder=str(cache_dir) if cache_dir else None,
+                local_files_only=bool(cached_model_path) or os.environ.get("HF_HUB_OFFLINE") == "1",
+            )
         self.base_path = Path(base_path or get_project_root() / "data" / "processed" / "faiss_index")
         self.version_prefix = version_prefix
-        self.index: faiss.IndexFlatIP | None = None
+        self.index: Any | None = None
         self.documents: list[dict[str, Any]] = []
         self.metadata_list: list[DocumentMetadata] = []
         self.current_version = 0
@@ -115,7 +125,7 @@ class VersionedVectorStore:
         self.documents = []
         self.metadata_list = []
         
-        if index_file.exists():
+        if index_file.exists() and faiss is not None and not getattr(self, "lightweight_mode", False):
             self.index = faiss.read_index(str(index_file))
         if docs_file.exists():
             with open(docs_file, "rb") as f:
@@ -133,7 +143,7 @@ class VersionedVectorStore:
         version_path = self.base_path / f"{self.version_prefix}{version}"
         version_path.mkdir(parents=True, exist_ok=True)
         
-        if self.index is not None:
+        if self.index is not None and faiss is not None and not getattr(self, "lightweight_mode", False):
             faiss.write_index(self.index, str(version_path / "index.faiss"))
         with open(version_path / "documents.pkl", "wb") as f:
             pickle.dump(self.documents, f)
@@ -174,11 +184,14 @@ class VersionedVectorStore:
         embeddings = self.embedding_model.encode(documents, normalize_embeddings=True)
         embeddings = np.array(embeddings, dtype=np.float32)
         
-        if self.index is None:
+        if getattr(self, "lightweight_mode", False):
+            self.index = embeddings if self.index is None else np.vstack([self.index, embeddings])
+        elif self.index is None:
             dim = embeddings.shape[1]
             self.index = faiss.IndexFlatIP(dim)
-        
-        self.index.add(embeddings)
+
+        if not getattr(self, "lightweight_mode", False):
+            self.index.add(embeddings)
         for doc, meta, content_hash in filtered:
             doc_id = f"doc_{len(self.documents)}"
             self.documents.append({
@@ -214,8 +227,11 @@ class VersionedVectorStore:
             documents = [doc for doc, _, _ in unique]
             embeddings = self.embedding_model.encode(documents, normalize_embeddings=True)
             embeddings = np.array(embeddings, dtype=np.float32)
-            self.index = faiss.IndexFlatIP(embeddings.shape[1])
-            self.index.add(embeddings)
+            if getattr(self, "lightweight_mode", False):
+                self.index = embeddings
+            else:
+                self.index = faiss.IndexFlatIP(embeddings.shape[1])
+                self.index.add(embeddings)
         else:
             self.index = None
 
@@ -241,6 +257,11 @@ class VersionedVectorStore:
             return []
         
         query_embedding = query_embedding.reshape(1, -1).astype(np.float32)
+        if getattr(self, "lightweight_mode", False):
+            scores = np.dot(self.index, query_embedding[0])
+            indices = np.argsort(-scores)[:top_k]
+            return [(int(idx), float(scores[idx])) for idx in indices]
+
         scores, indices = self.index.search(query_embedding, min(top_k, self.index.ntotal))
         
         results = []
@@ -266,3 +287,24 @@ class VersionedVectorStore:
     def list_versions(self) -> list[int]:
         """List available versions for rollback."""
         return [self._version_number(p) for p in self._version_dirs()]
+
+
+class LightweightEmbeddingModel:
+    """Small deterministic embedding model for low-memory cloud deploys."""
+
+    dimension = 256
+
+    def _tokenize(self, text: str) -> list[str]:
+        return re.findall(r"\b[a-z0-9][a-z0-9_-]*\b", text.lower())
+
+    def _embed_one(self, text: str) -> np.ndarray:
+        vector = np.zeros(self.dimension, dtype=np.float32)
+        for token in self._tokenize(text):
+            vector[hash(token) % self.dimension] += 1.0
+        norm = np.linalg.norm(vector)
+        return vector / norm if norm else vector
+
+    def encode(self, values, normalize_embeddings: bool = True):
+        if isinstance(values, str):
+            return self._embed_one(values)
+        return np.array([self._embed_one(value) for value in values], dtype=np.float32)

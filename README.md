@@ -182,6 +182,7 @@ Open `http://localhost:8000` for the browser chat UI.
 ### 7. Deploy for Friends
 
 The project includes `Dockerfile`, `render.yaml`, and `railway.json`.
+Free-tier cloud deploys run with `LIGHTWEIGHT_DEPLOY=1`, which avoids large FAISS/sentence-transformer/Torch memory use and uses the BM25/SQL/REST grounded retrieval path.
 
 #### Render
 

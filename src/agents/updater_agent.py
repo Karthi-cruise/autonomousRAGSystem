@@ -68,7 +68,7 @@ class UpdaterAgent:
     def remove_outdated(self, doc_indices: list[int]) -> int:
         """Create new version with specified documents removed."""
         import numpy as np
-        import faiss
+        from src.retrieval.vector_store import faiss
 
         to_remove = set(doc_indices)
         new_docs = []
@@ -81,10 +81,14 @@ class UpdaterAgent:
         if not new_docs:
             return self.vector_store.current_version
 
-        # Rebuild FAISS index and documents
+        # Rebuild index and documents
         emb = self.vector_store.embedding_model.encode(new_docs, normalize_embeddings=True)
-        self.vector_store.index = faiss.IndexFlatIP(emb.shape[1])
-        self.vector_store.index.add(np.array(emb, dtype=np.float32))
+        emb = np.array(emb, dtype=np.float32)
+        if getattr(self.vector_store, "lightweight_mode", False):
+            self.vector_store.index = emb
+        else:
+            self.vector_store.index = faiss.IndexFlatIP(emb.shape[1])
+            self.vector_store.index.add(emb)
         self.vector_store.documents = [
             {
                 "id": f"doc_{i}",
