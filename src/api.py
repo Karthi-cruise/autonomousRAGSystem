@@ -29,7 +29,14 @@ def create_app(system: dict[str, Any] | None = None):
         version="1.0.0",
     )
 
-    _system = system or build_system()
+    _system = system
+
+    def get_system() -> dict[str, Any]:
+        """Build the RAG system lazily so deploy health checks can pass fast."""
+        nonlocal _system
+        if _system is None:
+            _system = build_system()
+        return _system
 
     @app.get("/health")
     def health():
@@ -44,7 +51,7 @@ def create_app(system: dict[str, Any] | None = None):
     @app.post("/query")
     def run_query(req: QueryRequest):
         try:
-            resp = run_system_query(_system, req.query)
+            resp = run_system_query(get_system(), req.query)
             return resp.to_dict()
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -52,7 +59,7 @@ def create_app(system: dict[str, Any] | None = None):
     @app.post("/ingest")
     def ingest(req: IngestRequest):
         try:
-            v = _system["updater"].ingest_documents(
+            v = get_system()["updater"].ingest_documents(
                 documents=[req.content],
                 source=req.source,
                 trust_score=req.trust_score,
@@ -63,11 +70,11 @@ def create_app(system: dict[str, Any] | None = None):
 
     @app.get("/versions")
     def list_versions():
-        return {"versions": _system["updater"].list_versions()}
+        return {"versions": get_system()["updater"].list_versions()}
 
     @app.get("/tools")
     def list_tools():
-        tool_manager = _system.get("tools")
+        tool_manager = get_system().get("tools")
         return {"tools": tool_manager.describe() if tool_manager else []}
 
     return app

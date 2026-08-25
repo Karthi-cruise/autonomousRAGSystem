@@ -1,7 +1,7 @@
 services:
   - type: web
     name: autonomous-rag-system
-    env: docker
+    runtime: docker
     plan: free
     healthCheckPath: /health
     envVars:
